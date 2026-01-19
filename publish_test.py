@@ -4,64 +4,105 @@ import uuid
 from datetime import datetime
 
 # ---------------------------
-# 1️⃣ Connect to RabbitMQ
+# RabbitMQ Configuration
 # ---------------------------
+MQ_HOST = "localhost"   # for local run
+MQ_PORT = 5672
+MQ_USER = "guest"
+MQ_PASS = "guest"
+PAYMENT_QUEUE = "payment_initiation"
+
+# ---------------------------
+# Connect to RabbitMQ
+# ---------------------------
+credentials = pika.PlainCredentials(MQ_USER, MQ_PASS)
+
 connection = pika.BlockingConnection(
     pika.ConnectionParameters(
-        'localhost',
-        5672,
-        credentials=pika.PlainCredentials('guest', 'guest')
+        host=MQ_HOST,
+        port=MQ_PORT,
+        credentials=credentials
     )
 )
+
 channel = connection.channel()
 
-# Ensure queues exist
-channel.queue_declare(queue='payment_initiation', durable=True)
+# Ensure queue exists
+channel.queue_declare(queue=PAYMENT_QUEUE, durable=True)
 
 # ---------------------------
-# 2️⃣ Function to publish a payment event
+# Publish Payment Event
 # ---------------------------
-def publish_payment_event(amount, currency, user_id, idempotency_key=None, simulate_transient_failure=False, simulate_permanent_failure=False):
+def publish_payment_event(
+    amount,
+    currency,
+    user_id,
+    idempotency_key=None,
+    simulate_transient_failure=False,
+    simulate_permanent_failure=False
+):
     if not idempotency_key:
         idempotency_key = str(uuid.uuid4())
 
-    message = {
+    event = {
         "idempotency_key": idempotency_key,
         "amount": amount,
         "currency": currency,
         "user_id": user_id,
-        "timestamp": datetime.now().isoformat() + "Z",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
         "metadata": {
-            "source_system": "test-publisher",
+            "source": "publish_test",
             "simulate_transient_failure": simulate_transient_failure,
             "simulate_permanent_failure": simulate_permanent_failure
         }
     }
 
     channel.basic_publish(
-        exchange='',
-        routing_key='payment_initiation',
-        body=json.dumps(message),
-        properties=pika.BasicProperties(delivery_mode=2)  # persistent
+        exchange="",
+        routing_key=PAYMENT_QUEUE,
+        body=json.dumps(event),
+        properties=pika.BasicProperties(
+            delivery_mode=2  # make message persistent
+        )
     )
-    print(f" [x] Sent payment {idempotency_key} for {amount} {currency} | transient={simulate_transient_failure} | permanent={simulate_permanent_failure}")
+
+    print(
+        f"[x] Sent payment | key={idempotency_key} | "
+        f"{amount} {currency} | "
+        f"transient={simulate_transient_failure} | "
+        f"permanent={simulate_permanent_failure}"
+    )
 
 # ---------------------------
-# 3️⃣ Send test payments
+# Test Scenarios
 # ---------------------------
 
-# Idempotency test (already tested)
+print("\n--- Sending test payment events ---\n")
+
+# 1️⃣ Idempotency test (same key twice)
 fixed_key = "fixed-key-12345"
-publish_payment_event(50.00, "USD", "user-beta", idempotency_key=fixed_key)
-publish_payment_event(50.00, "USD", "user-beta", idempotency_key=fixed_key)
+publish_payment_event(50.0, "USD", "user-alpha", idempotency_key=fixed_key)
+publish_payment_event(50.0, "USD", "user-alpha", idempotency_key=fixed_key)
 
-# Transient failure test
-publish_payment_event(75.00, "USD", "user-gamma", simulate_transient_failure=True)
+# 2️⃣ Transient failure (should retry)
+publish_payment_event(
+    75.0,
+    "USD",
+    "user-beta",
+    simulate_transient_failure=True
+)
 
-# Permanent failure test
-publish_payment_event(125.00, "USD", "user-delta", simulate_permanent_failure=True)
+# 3️⃣ Permanent failure (should go to DLQ)
+publish_payment_event(
+    125.0,
+    "USD",
+    "user-gamma",
+    simulate_permanent_failure=True
+)
 
 # ---------------------------
-# 4️⃣ Close connection
+# Close connection
 # ---------------------------
 connection.close()
+
+print("\n✔ All test messages published\n")

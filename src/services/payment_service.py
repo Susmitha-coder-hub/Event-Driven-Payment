@@ -1,37 +1,44 @@
 import random
 import time
+from datetime import datetime
 from prometheus_client import Counter
 
 # ---------------------------
 # Custom Exceptions
 # ---------------------------
 class TransientError(Exception):
-    """Represents a temporary error that can be retried."""
+    """Temporary error that can be retried"""
     pass
+
 
 class PermanentError(Exception):
-    """Represents a permanent error that cannot be retried."""
+    """Permanent error that must go to DLQ"""
     pass
 
+
 # ---------------------------
-# Prometheus Counters
+# Prometheus Metrics
 # ---------------------------
 messages_consumed = Counter(
-    'payment_processor_messages_consumed_total',
-    'Total payment messages consumed'
+    "payment_processor_messages_consumed_total",
+    "Total payment messages consumed"
 )
+
 payments_successful = Counter(
-    'payment_processor_payments_successful_total',
-    'Total payments successfully processed'
+    "payment_processor_payments_successful_total",
+    "Total payments successfully processed"
 )
+
 payments_failed = Counter(
-    'payment_processor_payments_failed_total',
-    'Total payments permanently failed'
+    "payment_processor_payments_failed_total",
+    "Total payments permanently failed"
 )
+
 retries_total = Counter(
-    'payment_processor_retries_total',
-    'Total retries attempted for transient failures'
+    "payment_processor_retries_total",
+    "Total retries attempted for transient failures"
 )
+
 
 # ---------------------------
 # Payment Service
@@ -39,39 +46,31 @@ retries_total = Counter(
 class PaymentService:
     def __init__(self, repo):
         """
-        repo: repository object to interact with MongoDB.
-        Must implement:
-          - find_by_idempotency_key(key)
-          - create_transaction(transaction_dict)
-          - update_transaction(key, update_dict)
+        repo must implement:
+        - find_by_idempotency_key(key)
+        - create_transaction(data)
+        - update_transaction(key, update)
         """
         self.repo = repo
 
     def process_payment(self, event):
-        """
-        Processes a single payment event.
-
-        Event format:
-        {
-            "idempotency_key": str,
-            "user_id": str,
-            "amount": float,
-            "currency": str,
-            "metadata": {optional dictionary}
-        }
-        """
-
         key = event["idempotency_key"]
-        messages_consumed.inc()  # Increment total messages consumed
+        messages_consumed.inc()
 
-        simulate_transient = event.get("metadata", {}).get("simulate_transient_failure", False)
-        simulate_permanent = event.get("metadata", {}).get("simulate_permanent_failure", False)
+        simulate_transient = event.get("metadata", {}).get(
+            "simulate_transient_failure", False
+        )
+        simulate_permanent = event.get("metadata", {}).get(
+            "simulate_permanent_failure", False
+        )
 
         # ---------------------------
-        # 1️⃣ Idempotency check
+        # 1️⃣ Idempotency Check
         # ---------------------------
         existing = self.repo.find_by_idempotency_key(key)
+
         if existing and existing["status"] == "COMPLETED":
+            # Already processed successfully
             return "IDEMPOTENT_SKIP"
 
         if not existing:
@@ -82,14 +81,16 @@ class PaymentService:
                 "user_id": event["user_id"],
                 "status": "PROCESSING",
                 "retry_count": 0,
-                "last_error_message": None
+                "last_error_message": None,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
             })
 
         # ---------------------------
-        # 2️⃣ Payment processing simulation
+        # 2️⃣ Simulate Processing
         # ---------------------------
         try:
-            time.sleep(0.1)  # Simulate processing time
+            time.sleep(0.1)
 
             # Simulated failures
             if simulate_transient or random.random() < 0.2:
@@ -99,37 +100,42 @@ class PaymentService:
                 raise PermanentError("Invalid card details")
 
             # ---------------------------
-            # 3️⃣ Successful payment
+            # 3️⃣ Success
             # ---------------------------
-            self.repo.update_transaction(key, {"status": "COMPLETED"})
+            self.repo.update_transaction(key, {
+                "status": "COMPLETED",
+                "updated_at": datetime.utcnow()
+            })
             payments_successful.inc()
             return "SUCCESS"
 
         # ---------------------------
-        # 4️⃣ Handle transient failures
+        # 4️⃣ Transient Failure (RETRY)
         # ---------------------------
         except TransientError as e:
             retries_total.inc()
 
             retry_count = (existing.get("retry_count", 0) + 1) if existing else 1
+
             self.repo.update_transaction(key, {
-                "status": "FAILED",
+                "status": "RETRYING",   # ✅ IMPORTANT FIX
                 "retry_count": retry_count,
-                "last_error_message": str(e)
+                "last_error_message": str(e),
+                "updated_at": datetime.utcnow()
             })
 
-            # Re-raise for consumer to trigger retry logic
             raise
 
         # ---------------------------
-        # 5️⃣ Handle permanent failures
+        # 5️⃣ Permanent Failure (DLQ)
         # ---------------------------
         except PermanentError as e:
             payments_failed.inc()
+
             self.repo.update_transaction(key, {
                 "status": "FAILED",
-                "last_error_message": str(e)
+                "last_error_message": str(e),
+                "updated_at": datetime.utcnow()
             })
 
-            # Re-raise for consumer to send to DLQ
             raise

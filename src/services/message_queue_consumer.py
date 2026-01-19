@@ -4,6 +4,13 @@ import pika
 from config import Config
 from services.payment_service import TransientError, PermanentError
 
+from api.health_metrics import (
+    messages_consumed,
+    payments_successful,
+    payments_failed,
+    payment_retries
+)
+
 
 class MQConsumer:
     def __init__(self, payment_service):
@@ -16,8 +23,10 @@ class MQConsumer:
         while True:
             try:
                 print("Connecting to RabbitMQ...")
+
                 credentials = pika.PlainCredentials(
-                    Config.MQ_USER, Config.MQ_PASS
+                    Config.MQ_USER,
+                    Config.MQ_PASS
                 )
 
                 connection = pika.BlockingConnection(
@@ -36,6 +45,7 @@ class MQConsumer:
                     queue=Config.PAYMENT_INITIATION_QUEUE,
                     durable=True
                 )
+
                 self.channel.queue_declare(
                     queue=Config.PAYMENT_DLQ,
                     durable=True
@@ -58,13 +68,19 @@ class MQConsumer:
         self.channel.start_consuming()
 
     def _callback(self, ch, method, properties, body):
+        messages_consumed.inc()
         event = json.loads(body)
 
         try:
+            # Try processing payment
             self.payment_service.process_payment(event)
+
+            payments_successful.inc()
             ch.basic_ack(delivery_tag=method.delivery_tag)
 
         except TransientError as e:
+            payment_retries.inc()
+
             retries = 0
             if properties.headers and "x-retry" in properties.headers:
                 retries = properties.headers["x-retry"]
@@ -73,10 +89,15 @@ class MQConsumer:
 
             if retries >= Config.PAYMENT_RETRY_LIMIT:
                 print("Retry limit exceeded, sending to DLQ ❌")
+                payments_failed.inc()
+
                 ch.basic_publish(
                     exchange="",
                     routing_key=Config.PAYMENT_DLQ,
-                    body=body
+                    body=body,
+                    properties=pika.BasicProperties(
+                        delivery_mode=2
+                    )
                 )
             else:
                 delay = 2 ** retries
@@ -96,9 +117,15 @@ class MQConsumer:
 
         except PermanentError as e:
             print(f"Permanent error, sending to DLQ ❌: {str(e)}")
+            payments_failed.inc()
+
             ch.basic_publish(
                 exchange="",
                 routing_key=Config.PAYMENT_DLQ,
-                body=body
+                body=body,
+                properties=pika.BasicProperties(
+                    delivery_mode=2
+                )
             )
+
             ch.basic_ack(delivery_tag=method.delivery_tag)

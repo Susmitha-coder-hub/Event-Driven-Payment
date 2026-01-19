@@ -4,3 +4,5 @@ pika
 prometheus_client
 python-dotenv
 pytest
+gunicorn
+
